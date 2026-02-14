@@ -16,6 +16,12 @@ struct SvgReader {
     primitives: Vec<Primitive>,
 }
 
+const TOLERANCE: f32 = 2.0;
+const C2Q_TOLERANCE: f32 = 0.0009 * TOLERANCE;
+const Q2L_TOLERANCE: f32 = 0.009 * TOLERANCE;
+const MERGE_Q_TOLERANCE: f32 = 0.00005 * TOLERANCE;
+const MERGE_L_TOLERANCE: f32 = 0.005 * TOLERANCE;
+
 impl SvgReader {
     pub fn new(path: &str) -> Self {
         let mut content = String::new();
@@ -180,8 +186,7 @@ impl SvgReader {
         let error1 = ((x1 - expected_p1_x).powi(2) + (y1 - expected_p1_y).powi(2)).sqrt();
         let error2 = ((x2 - expected_p2_x).powi(2) + (y2 - expected_p2_y).powi(2)).sqrt();
 
-        const TOLERANCE: f32 = 0.005;
-        error1 < TOLERANCE && error2 < TOLERANCE
+        error1 < C2Q_TOLERANCE && error2 < C2Q_TOLERANCE
     }
 
     fn quadratic_is_line_like(x0: f32, y0: f32, x1: f32, y1: f32, x2: f32, y2: f32) -> bool {
@@ -191,8 +196,7 @@ impl SvgReader {
         let bcy = y2 - y1;
         let abl = (abx * abx + aby * aby).sqrt();
         let bcl = (bcx * bcx + bcy * bcy).sqrt();
-        const TOLERANCE: f32 = 0.005;
-        ((abx * bcx + aby * bcy) / (abl * bcl) - 1.0).abs() < TOLERANCE
+        ((abx * bcx + aby * bcy) / (abl * bcl) - 1.0).abs() < Q2L_TOLERANCE
     }
 
     fn lines_are_collinear(x0: f32, y0: f32, x1: f32, y1: f32, x2: f32, y2: f32) -> bool {
@@ -203,7 +207,7 @@ impl SvgReader {
         if max_dist < 1e-6 {
             return true;
         }
-        (area.abs() / max_dist) < 0.005
+        (area.abs() / max_dist) < MERGE_L_TOLERANCE
     }
 
     fn optimize(&mut self) {
@@ -293,8 +297,7 @@ impl SvgReader {
 
                     let should_merge = || -> bool {
                         const SAMPLES: usize = 16;
-                        let threshold: f32 = 0.0032;
-                        let threshold_sq = threshold * threshold;
+                        let threshold_sq = MERGE_Q_TOLERANCE * MERGE_Q_TOLERANCE;
                         for i in 1..SAMPLES {
                             let t = i as f32 / SAMPLES as f32;
                             let (ox, oy) = if t <= t_split {
@@ -537,6 +540,59 @@ impl SvgReader {
         println!("{s}");
     }
 
+    pub fn shader_arr(&self) {
+        let mut total_lines = 0;
+        let mut total_quads = 0;
+        for prim in &self.primitives {
+            match prim.clone() {
+                Primitive::Line(..) => {
+                    total_lines += 1;
+                }
+                Primitive::Quadratic(..) => {
+                    total_quads += 1;
+                }
+                _ => {}
+            }
+        }
+        let mut lines = format!("vec4 lines[{total_lines}] = vec4[](");
+        let mut quad_ab = format!("vec4 quad_ab[{total_quads}] = vec4[](");
+        let mut quad_c = format!("vec2 quad_c[{total_quads}] = vec2[](");
+        let (mut x0, mut y0) = (0.0, 0.0);
+        let f = |x: f32| -> String {
+            let mut s = if x < 0.001 {
+                format!("{x:.0}.")
+            } else {
+                format!("{x:.3}")
+            };
+            s = s.trim_end_matches("0").to_string();
+            s
+        };
+        let primitives = self.normalized(true);
+        for prim in &primitives {
+            match prim.clone() {
+                Primitive::Line(x1, y1) => {
+                    lines += &format!("vec4({},{},{},{}),", f(x0), f(y0), f(x1), f(y1));
+                }
+                Primitive::Quadratic(x1, y1, x2, y2) => {
+                    quad_ab += &format!("vec4({},{},{},{}),", f(x0), f(y0), f(x1), f(y1));
+                    quad_c += &format!("vec2({}, {}),", f(x2), f(y2));
+                }
+                _ => {}
+            }
+            (x0, y0) = Self::move_origin(prim);
+        }
+        let lines = &lines[..lines.len() - 1];
+        let quad_ab = &quad_ab[..quad_ab.len() - 1];
+        let quad_c = &quad_c[..quad_c.len() - 1];
+        println!("{lines});");
+        println!("{quad_ab});");
+        println!("{quad_c});");
+        println!("for (int i = 0; i < lines.length(); ++i) combine(d, sdf_line(p, lines[i]));");
+        println!(
+            "for (int i = 0; i < quad_ab.length(); ++i) combine(d, sdf_bezier(p, quad_ab[i], quad_c[i]));"
+        );
+    }
+
     fn aabb_cubic(
         x0: f32,
         y0: f32,
@@ -659,5 +715,5 @@ fn main() {
     let mut svg = SvgReader::new("test.svg");
     svg.optimize();
     // svg.save("save.svg");
-    svg.shader();
+    svg.shader_arr();
 }
