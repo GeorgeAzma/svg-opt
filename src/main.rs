@@ -16,11 +16,11 @@ struct SvgReader {
     primitives: Vec<Primitive>,
 }
 
-const TOLERANCE: f32 = 2.0;
-const C2Q_TOLERANCE: f32 = 0.0009 * TOLERANCE;
-const Q2L_TOLERANCE: f32 = 0.009 * TOLERANCE;
-const MERGE_Q_TOLERANCE: f32 = 0.00005 * TOLERANCE;
-const MERGE_L_TOLERANCE: f32 = 0.005 * TOLERANCE;
+const TOLERANCE: f32 = 1.0;
+const C2Q_TOLERANCE: f32 = 1.0 * TOLERANCE;
+const Q2L_TOLERANCE: f32 = 1.0 * TOLERANCE;
+const MERGE_Q_TOLERANCE: f32 = 1.0 * TOLERANCE;
+const MERGE_L_TOLERANCE: f32 = 1.0 * TOLERANCE;
 
 impl SvgReader {
     pub fn new(path: &str) -> Self {
@@ -162,7 +162,7 @@ impl SvgReader {
         }
     }
 
-    fn cubic_is_quadratic_like(
+    fn cubic_arc_length(
         x0: f32,
         y0: f32,
         x1: f32,
@@ -171,43 +171,405 @@ impl SvgReader {
         y2: f32,
         x3: f32,
         y3: f32,
-    ) -> bool {
-        // Check if control points are roughly collinear with their ideal quadratic position
-        // Ideal: p1 and p2 should both be near (2*q - 0.5*(p0+p3))
-        let qx = (3.0 * (x1 + x2) - x3 - x0) * 0.25;
-        let qy = (3.0 * (y1 + y2) - y3 - y0) * 0.25;
+    ) -> f32 {
+        // 5-point Gauss-Legendre quadrature on [0, 1]
+        const NODES: [f32; 5] = [
+            0.046910077,
+            0.230765346,
+            0.500000000,
+            0.769234654,
+            0.953089923,
+        ];
+        const WEIGHTS: [f32; 5] = [
+            0.118463443,
+            0.239314335,
+            0.284444444,
+            0.239314335,
+            0.118463443,
+        ];
 
-        // Expected cubic control points from this quadratic
-        let expected_p1_x = x0 + (2.0 / 3.0) * (qx - x0);
-        let expected_p1_y = y0 + (2.0 / 3.0) * (qy - y0);
-        let expected_p2_x = x3 + (2.0 / 3.0) * (qx - x3);
-        let expected_p2_y = y3 + (2.0 / 3.0) * (qy - y3);
+        let deriv_len = |t: f32| {
+            let s = 1.0 - t;
+            // Derivative of cubic bezier / 3
+            let dx = s * s * (x1 - x0) + 2.0 * s * t * (x2 - x1) + t * t * (x3 - x2);
+            let dy = s * s * (y1 - y0) + 2.0 * s * t * (y2 - y1) + t * t * (y3 - y2);
+            // * 3 for the actual derivative, but it cancels in the ratio so keep it
+            (dx * dx + dy * dy).sqrt()
+        };
 
-        let error1 = ((x1 - expected_p1_x).powi(2) + (y1 - expected_p1_y).powi(2)).sqrt();
-        let error2 = ((x2 - expected_p2_x).powi(2) + (y2 - expected_p2_y).powi(2)).sqrt();
+        // The * 3.0 for the true derivative magnitude
+        3.0 * NODES
+            .iter()
+            .zip(WEIGHTS.iter())
+            .map(|(&n, &w)| w * deriv_len(n))
+            .sum::<f32>()
+    }
 
-        error1 < C2Q_TOLERANCE && error2 < C2Q_TOLERANCE
+    fn quadratic_arc_length(x0: f32, y0: f32, x1: f32, y1: f32, x2: f32, y2: f32) -> f32 {
+        const NODES: [f32; 5] = [
+            0.046910077,
+            0.230765346,
+            0.500000000,
+            0.769234654,
+            0.953089923,
+        ];
+        const WEIGHTS: [f32; 5] = [
+            0.118463443,
+            0.239314335,
+            0.284444444,
+            0.239314335,
+            0.118463443,
+        ];
+
+        let deriv_len = |t: f32| {
+            let s = 1.0 - t;
+            // Derivative of quadratic bezier / 2
+            let dx = s * (x1 - x0) + t * (x2 - x1);
+            let dy = s * (y1 - y0) + t * (y2 - y1);
+            (dx * dx + dy * dy).sqrt()
+        };
+
+        // * 2.0 for the true derivative magnitude
+        2.0 * NODES
+            .iter()
+            .zip(WEIGHTS.iter())
+            .map(|(&n, &w)| w * deriv_len(n))
+            .sum::<f32>()
+    }
+
+    fn cubic_tangent(
+        t: f32,
+        x0: f32,
+        y0: f32,
+        x1: f32,
+        y1: f32,
+        x2: f32,
+        y2: f32,
+        x3: f32,
+        y3: f32,
+    ) -> (f32, f32) {
+        let s = 1.0 - t;
+        let dx = 3.0 * (s * s * (x1 - x0) + 2.0 * s * t * (x2 - x1) + t * t * (x3 - x2));
+        let dy = 3.0 * (s * s * (y1 - y0) + 2.0 * s * t * (y2 - y1) + t * t * (y3 - y2));
+        (dx, dy)
+    }
+
+    fn quadratic_tangent(
+        t: f32,
+        x0: f32,
+        y0: f32,
+        x1: f32,
+        y1: f32,
+        x2: f32,
+        y2: f32,
+    ) -> (f32, f32) {
+        let s = 1.0 - t;
+        let dx = 2.0 * (s * (x1 - x0) + t * (x2 - x1));
+        let dy = 2.0 * (s * (y1 - y0) + t * (y2 - y1));
+        (dx, dy)
+    }
+
+    /// Angle between two tangent vectors in [0, π]. Returns 0 for degenerate inputs.
+    fn tangent_angle_diff(dx0: f32, dy0: f32, dx1: f32, dy1: f32) -> f32 {
+        let len0 = (dx0 * dx0 + dy0 * dy0).sqrt();
+        let len1 = (dx1 * dx1 + dy1 * dy1).sqrt();
+        if len0 < f32::EPSILON || len1 < f32::EPSILON {
+            return 0.0;
+        }
+        let dot = ((dx0 * dx1 + dy0 * dy1) / (len0 * len1)).clamp(-1.0, 1.0);
+        dot.acos()
+    }
+
+    /// Finds the control point C = (cx, cy) that minimises a weighted combination of:
+    ///   - positional error:  ||Q(t_i) - cubic(t_i)||²  (keeps shape accurate)
+    ///   - tangent alignment: (Q'(t_i) × cubic'(t_i))²  (prevents join artifacts)
+    ///
+    /// The two criteria live in different units, so `tan_weight` scales the tangent
+    /// terms relative to position. higher values bias the control point
+    /// toward preserving direction at the cost of shape fit.
+    fn cubic_to_quadratic_least_squares(
+        x0: f32,
+        y0: f32,
+        x1: f32,
+        y1: f32,
+        x2: f32,
+        y2: f32,
+        x3: f32,
+        y3: f32,
+        tan_weight: f32,
+    ) -> (f32, f32) {
+        // For Q(t) = (1-t)²·P0 + 2t(1-t)·C + t²·P3:
+        //
+        // Positional rows (decoupled x/y):
+        //   a_i·cx = rx_i    where a_i = 2t(1-t),  rx_i = cubic_x(t) - (1-t)²x0 - t²x3
+        //   a_i·cy = ry_i
+        //
+        // Tangent row (couples cx and cy via cross product):
+        //   Q'(t)/2 = (1-2t)·C - (1-t)·P0 + t·P3
+        //   Cross product with unit cubic tangent (gdx, gdy) = 0 for perfect alignment:
+        //   (1-2t)·(cx·gdy - cy·gdx) = (1-t)·(x0·gdy - y0·gdx) + t·(x3·gdy - y3·gdx)
+        //   i.e. [(1-2t)·gdy, -(1-2t)·gdx] · [cx, cy] = K_i
+        //
+        // Assembles into a 2×2 normal equations: (AᵀA)·[cx,cy]ᵀ = Aᵀb
+
+        const SAMPLES: usize = 64;
+
+        // Normal equations accumulators: M = AᵀA, r = Aᵀb
+        let mut m00 = 0.0f32; // cx·cx
+        let mut m01 = 0.0f32; // cx·cy (symmetric)
+        let mut m11 = 0.0f32; // cy·cy
+        let mut r0 = 0.0f32; // rhs for cx
+        let mut r1 = 0.0f32; // rhs for cy
+
+        for i in 1..SAMPLES {
+            let t = i as f32 / SAMPLES as f32;
+            let s = 1.0 - t;
+            let a = 2.0 * t * s; // basis weight for C in Q(t)
+
+            // --- Positional contribution ---
+            let (cx_cubic, cy_cubic) = Self::cubic(t, x0, y0, x1, y1, x2, y2, x3, y3);
+            let rx = cx_cubic - s * s * x0 - t * t * x3;
+            let ry = cy_cubic - s * s * y0 - t * t * y3;
+
+            // Row [a, 0] -> cx equation; row [0, a] -> cy equation (weight 1.0)
+            m00 += a * a;
+            m11 += a * a;
+            r0 += a * rx;
+            r1 += a * ry;
+
+            // --- Tangent contribution ---
+            // Skip t = 0.5 exactly: (1-2t) = 0, tangent row degenerates
+            let coeff = 1.0 - 2.0 * t;
+            if coeff.abs() < 1e-4 {
+                continue;
+            }
+
+            let (tdx, tdy) = Self::cubic_tangent(t, x0, y0, x1, y1, x2, y2, x3, y3);
+            let tlen = (tdx * tdx + tdy * tdy).sqrt();
+            if tlen < f32::EPSILON {
+                continue;
+            }
+            // Normalise so tangent rows are scale-independent
+            let gdx = tdx / tlen;
+            let gdy = tdy / tlen;
+
+            // Tangent row: [coeff·gdy, -coeff·gdx] · [cx, cy] = K
+            let k = s * (x0 * gdy - y0 * gdx) - t * (x3 * gdy - y3 * gdx);
+            let row_x = coeff * gdy;
+            let row_y = -coeff * gdx;
+
+            let w = tan_weight;
+            m00 += w * row_x * row_x;
+            m01 += w * row_x * row_y;
+            m11 += w * row_y * row_y;
+            r0 += w * row_x * k;
+            r1 += w * row_y * k;
+        }
+
+        // Solve 2×2 symmetric system (M is symmetric so m01 == m10)
+        let det = m00 * m11 - m01 * m01;
+        if det.abs() < f32::EPSILON {
+            // Degenerate: fall back to pure positional least-squares result
+            let a2_sum = m00 - {
+                // recompute just positional diagonal (approx)
+                let mut s = 0.0f32;
+                for i in 1..SAMPLES {
+                    let t = i as f32 / SAMPLES as f32;
+                    let a = 2.0 * t * (1.0 - t);
+                    s += a * a;
+                }
+                s * tan_weight // subtract tangent part... just use r0/m00 as fallback
+            };
+            let _ = a2_sum;
+            return (r0 / m00.max(f32::EPSILON), r1 / m11.max(f32::EPSILON));
+        }
+
+        let cx = (r0 * m11 - r1 * m01) / det;
+        let cy = (r1 * m00 - r0 * m01) / det;
+        (cx, cy)
+    }
+
+    fn try_cubic_to_quadratic(
+        x0: f32,
+        y0: f32,
+        x1: f32,
+        y1: f32,
+        x2: f32,
+        y2: f32,
+        x3: f32,
+        y3: f32,
+    ) -> Option<(f32, f32)> {
+        // tan_weight: 0.0 = pure shape fit, higher = more tangent-biased.
+        // 0.5 is a good default: tangent errors (which cause visible kinks) are
+        // penalised meaningfully without sacrificing shape accuracy.
+        let (qx, qy) = Self::cubic_to_quadratic_least_squares(x0, y0, x1, y1, x2, y2, x3, y3, 16.0);
+
+        let arc_len = Self::cubic_arc_length(x0, y0, x1, y1, x2, y2, x3, y3);
+        let pos_threshold = (C2Q_TOLERANCE * arc_len * 0.015).max(f32::EPSILON);
+        const TAN_THRESHOLD: f32 = 0.05;
+
+        const SAMPLES: usize = 64;
+        for i in 1..SAMPLES {
+            let t = i as f32 / SAMPLES as f32;
+
+            let (cx, cy) = Self::cubic(t, x0, y0, x1, y1, x2, y2, x3, y3);
+            let (qbx, qby) = Self::quadratic(t, x0, y0, qx, qy, x3, y3);
+            let pos_err = ((cx - qbx) * (cx - qbx) + (cy - qby) * (cy - qby)).sqrt();
+
+            let (cdx, cdy) = Self::cubic_tangent(t, x0, y0, x1, y1, x2, y2, x3, y3);
+            let (qdx, qdy) = Self::quadratic_tangent(t, x0, y0, qx, qy, x3, y3);
+            let tan_err = Self::tangent_angle_diff(cdx, cdy, qdx, qdy);
+
+            if pos_err > pos_threshold || tan_err > TAN_THRESHOLD {
+                return None;
+            }
+        }
+
+        Some((qx, qy))
     }
 
     fn quadratic_is_line_like(x0: f32, y0: f32, x1: f32, y1: f32, x2: f32, y2: f32) -> bool {
-        let abx = x1 - x0;
-        let aby = y1 - y0;
-        let bcx = x2 - x1;
-        let bcy = y2 - y1;
-        let abl = (abx * abx + aby * aby).sqrt();
-        let bcl = (bcx * bcx + bcy * bcy).sqrt();
-        ((abx * bcx + aby * bcy) / (abl * bcl) - 1.0).abs() < Q2L_TOLERANCE
+        let dx = x2 - x0;
+        let dy = y2 - y0;
+        let chord_len = (dx * dx + dy * dy).sqrt();
+        let perp_dist = (dx * (x1 - x0) - dy * (y1 - y0)).abs() / chord_len.max(1e-6);
+        0.5 * perp_dist < Q2L_TOLERANCE * 0.0003
     }
 
     fn lines_are_collinear(x0: f32, y0: f32, x1: f32, y1: f32, x2: f32, y2: f32) -> bool {
-        let area = (x1 - x0) * (y2 - y0) - (y1 - y0) * (x2 - x0);
-        let d1 = ((x1 - x0).powi(2) + (y1 - y0).powi(2)).sqrt();
-        let d2 = ((x2 - x1).powi(2) + (y2 - y1).powi(2)).sqrt();
-        let max_dist = d1.max(d2);
-        if max_dist < 1e-6 {
-            return true;
+        let chord_x = x2 - x0;
+        let chord_y = y2 - y0;
+        let chord_len = (chord_x * chord_x + chord_y * chord_y).sqrt();
+
+        let cross = ((x1 - x0) * chord_y - (y1 - y0) * chord_x).abs();
+        let perp_dist = cross / chord_len.max(1e-6);
+
+        perp_dist < MERGE_L_TOLERANCE * 0.001
+    }
+
+    // returns merged control point if within tolerance
+    fn merge_quadratics(
+        x0: f32,
+        y0: f32,
+        x1: f32,
+        y1: f32,
+        x2: f32,
+        y2: f32,
+        x3: f32,
+        y3: f32,
+        x4: f32,
+        y4: f32,
+    ) -> Option<(f32, f32)> {
+        let d1 = Self::quadratic_arc_length(x0, y0, x1, y1, x2, y2);
+        let d2 = Self::quadratic_arc_length(x2, y2, x3, y3, x4, y4);
+        let total = d1 + d2;
+        if total < 1e-8 {
+            return None;
         }
-        (area.abs() / max_dist) < MERGE_L_TOLERANCE
+        let t_split = d1 / total;
+
+        // Helper: evaluate the piecewise quadratic at merged-t
+        let piecewise = |t: f32| -> (f32, f32) {
+            if t <= t_split {
+                let t1 = t / t_split;
+                Self::quadratic(t1, x0, y0, x1, y1, x2, y2)
+            } else {
+                let t2 = (t - t_split) / (1.0 - t_split);
+                Self::quadratic(t2, x2, y2, x3, y3, x4, y4)
+            }
+        };
+
+        // Piecewise quadratic tangent at merged-t (unnormalized)
+        let piecewise_tangent = |t: f32| -> (f32, f32) {
+            if t <= t_split {
+                let t1 = t / t_split;
+                Self::quadratic_tangent(t1, x0, y0, x1, y1, x2, y2)
+            } else {
+                let t2 = (t - t_split) / (1.0 - t_split);
+                Self::quadratic_tangent(t2, x2, y2, x3, y3, x4, y4)
+            }
+        };
+
+        // --- Least-squares with tangent weighting (same pattern as cubic_to_quadratic) ---
+        const SAMPLES: usize = 64;
+        const TAN_WEIGHT: f32 = 16.0;
+
+        let mut m00 = 0.0f32;
+        let mut m01 = 0.0f32;
+        let mut m11 = 0.0f32;
+        let mut r0 = 0.0f32;
+        let mut r1 = 0.0f32;
+
+        for i in 1..SAMPLES {
+            let t = i as f32 / SAMPLES as f32;
+            let s = 1.0 - t;
+            let a = 2.0 * t * s;
+
+            // Positional contribution
+            let (px, py) = piecewise(t);
+            let rx = px - s * s * x0 - t * t * x4;
+            let ry = py - s * s * y0 - t * t * y4;
+
+            m00 += a * a;
+            m11 += a * a;
+            r0 += a * rx;
+            r1 += a * ry;
+
+            // Tangent contribution
+            let coeff = 1.0 - 2.0 * t;
+            if coeff.abs() < 1e-4 {
+                continue;
+            }
+
+            let (tdx, tdy) = piecewise_tangent(t);
+            let tlen = (tdx * tdx + tdy * tdy).sqrt();
+            if tlen < f32::EPSILON {
+                continue;
+            }
+            let gdx = tdx / tlen;
+            let gdy = tdy / tlen;
+
+            let k = s * (x0 * gdy - y0 * gdx) - t * (x4 * gdy - y4 * gdx);
+            let row_x = coeff * gdy;
+            let row_y = -coeff * gdx;
+
+            m00 += TAN_WEIGHT * row_x * row_x;
+            m01 += TAN_WEIGHT * row_x * row_y;
+            m11 += TAN_WEIGHT * row_y * row_y;
+            r0 += TAN_WEIGHT * row_x * k;
+            r1 += TAN_WEIGHT * row_y * k;
+        }
+
+        let det = m00 * m11 - m01 * m01;
+        let (cx, cy) = if det.abs() < f32::EPSILON {
+            (r0 / m00.max(f32::EPSILON), r1 / m11.max(f32::EPSILON))
+        } else {
+            ((r0 * m11 - r1 * m01) / det, (r1 * m00 - r0 * m01) / det)
+        };
+
+        // --- Validate: position and tangent ---
+        let pos_threshold = (MERGE_Q_TOLERANCE * total * 0.005).max(f32::EPSILON);
+        let tan_threshold = 0.05 * MERGE_Q_TOLERANCE.sqrt();
+
+        for i in 1..SAMPLES {
+            let t = i as f32 / SAMPLES as f32;
+
+            let (ox, oy) = piecewise(t);
+            let (ax, ay) = Self::quadratic(t, x0, y0, cx, cy, x4, y4);
+            let pos_err = ((ox - ax) * (ox - ax) + (oy - ay) * (oy - ay)).sqrt();
+            if pos_err > pos_threshold {
+                return None;
+            }
+
+            let (tdx, tdy) = piecewise_tangent(t);
+            let (qdx, qdy) = Self::quadratic_tangent(t, x0, y0, cx, cy, x4, y4);
+            let tan_err = Self::tangent_angle_diff(tdx, tdy, qdx, qdy);
+            if tan_err > tan_threshold {
+                return None;
+            }
+        }
+
+        Some((cx, cy))
     }
 
     fn optimize(&mut self) {
@@ -218,19 +580,35 @@ impl SvgReader {
         (x0, y0) = (0.0, 0.0);
         for prim in self.primitives.iter_mut() {
             match prim.clone() {
-                Primitive::Cubic(x1, y1, x2, y2, x3, y3)
-                    if Self::cubic_is_quadratic_like(x0, y0, x1, y1, x2, y2, x3, y3) =>
-                {
-                    let qx = (3.0 * (x1 + x2) - x3 - x0) * 0.25;
-                    let qy = (3.0 * (y1 + y2) - y3 - y0) * 0.25;
-                    *prim = Primitive::Quadratic(qx, qy, x3, y3);
+                Primitive::Cubic(x1, y1, x2, y2, x3, y3) => {
+                    if let Some((qx, qy)) =
+                        Self::try_cubic_to_quadratic(x0, y0, x1, y1, x2, y2, x3, y3)
+                    {
+                        *prim = Primitive::Quadratic(qx, qy, x3, y3);
+                    }
+                    // let (qx, qy) =
+                    //     Self::cubic_to_quadratic_tangent_preserving(x0, y0, x1, y1, x2, y2, x3, y3)
+                    //         .unwrap_or((
+                    //             (3.0 * (x1 + x2) - x3 - x0) * 0.25,
+                    //             (3.0 * (y1 + y2) - y3 - y0) * 0.25,
+                    //         ));
+                    // if Self::cubic_is_quadratic_like(x0, y0, x1, y1, x2, y2, x3, y3, qx, qy) {
+                    //     *prim = Primitive::Quadratic(qx, qy, x3, y3);
+                    // }
+                    // let (qx, qy) = (
+                    //     (3.0 * (x1 + x2) - x3 - x0) * 0.25,
+                    //     (3.0 * (y1 + y2) - y3 - y0) * 0.25,
+                    // );
+                    // if Self::cubic_is_quadratic_like(x0, y0, x1, y1, x2, y2, x3, y3, qx, qy) {
+                    //     *prim = Primitive::Quadratic(qx, qy, x3, y3);
+                    // }
                 }
                 _ => {}
             }
             (x0, y0) = Self::move_origin(prim);
         }
 
-        // // Cubic ~> 2x Quadratic
+        // Cubic ~> 2x Quadratic
         (x0, y0) = (0.0, 0.0);
         let mut primitives = Vec::new();
         for prim in self.primitives.iter_mut() {
@@ -270,54 +648,9 @@ impl SvgReader {
                     Some(Primitive::Quadratic(x1, y1, x2, y2)),
                     Primitive::Quadratic(x3, y3, x4, y4),
                 ) => {
-                    let dx1 = x2 - x1;
-                    let dy1 = y2 - y1;
-                    let dx2 = x3 - x2;
-                    let dy2 = y3 - y2;
+                    let merged = Self::merge_quadratics(x0, y0, x1, y1, x2, y2, x3, y3, x4, y4);
 
-                    let len1_sq = dx1 * dx1 + dy1 * dy1;
-                    let len2_sq = dx2 * dx2 + dy2 * dy2;
-
-                    let d1 = len1_sq.sqrt();
-                    let d2 = len2_sq.sqrt();
-                    let total = d1 + d2;
-                    let t_split = if total > 1e-8 { d1 / total } else { 0.5 };
-
-                    let u = 1.0 - t_split;
-                    let v = t_split;
-                    let denom = 2.0 * u * v;
-                    let (cx, cy) = if denom.abs() > 1e-8 {
-                        (
-                            (x2 - u * u * x0 - v * v * x4) / denom,
-                            (y2 - u * u * y0 - v * v * y4) / denom,
-                        )
-                    } else {
-                        (x2, y2)
-                    };
-
-                    let should_merge = || -> bool {
-                        const SAMPLES: usize = 16;
-                        let threshold_sq = MERGE_Q_TOLERANCE * MERGE_Q_TOLERANCE;
-                        for i in 1..SAMPLES {
-                            let t = i as f32 / SAMPLES as f32;
-                            let (ox, oy) = if t <= t_split {
-                                let t1 = t / t_split;
-                                Self::quadratic(t1, x0, y0, x1, y1, x2, y2)
-                            } else {
-                                let t2 = (t - t_split) / (1.0 - t_split);
-                                Self::quadratic(t2, x2, y2, x3, y3, x4, y4)
-                            };
-
-                            let (ax, ay) = Self::quadratic(t, x0, y0, cx, cy, x4, y4);
-
-                            if (ox - ax).powi(2) + (oy - ay).powi(2) > threshold_sq {
-                                return false;
-                            }
-                        }
-                        true
-                    };
-
-                    if should_merge() {
+                    if let Some((cx, cy)) = merged {
                         primitives.pop();
                         primitives.push(Primitive::Quadratic(cx, cy, x4, y4));
                         (current_x, current_y) = (x4, y4);
@@ -364,7 +697,6 @@ impl SvgReader {
         let mut primitives = Vec::new();
         let (mut x0, mut y0) = (0.0, 0.0); // Current position (end of last primitive)
         let (mut prev_start_x, mut prev_start_y) = (0.0, 0.0); // Start of last line
-
         for prim in self.primitives.iter() {
             match (primitives.last().cloned(), prim.clone()) {
                 (Some(Primitive::Line(x1, y1)), Primitive::Line(x2, y2))
@@ -388,22 +720,31 @@ impl SvgReader {
         }
         self.primitives = primitives;
 
-        let counts = self
-            .primitives
+        let mut counts =
+            self.primitives
+                .iter()
+                .fold(std::collections::HashMap::new(), |mut acc, p| {
+                    *acc.entry(match p {
+                        Primitive::Cubic(..) => "Cubic",
+                        Primitive::Quadratic(..) => "Quadr",
+                        Primitive::Line(..) => " Line",
+                        Primitive::Move(..) => "",
+                        Primitive::Arc(..) => " Arc",
+                        Primitive::Close => "",
+                    })
+                    .or_insert(0) += 1;
+                    acc
+                });
+        let total = counts.get("Cubic").unwrap_or(&0)
+            + counts.get("Quadr").unwrap_or(&0)
+            + counts.get(" Line").unwrap_or(&0);
+        counts.insert("Total", total);
+        let mut counts = counts
             .iter()
-            .fold(std::collections::HashMap::new(), |mut acc, p| {
-                *acc.entry(match p {
-                    Primitive::Cubic(..) => "Cubic",
-                    Primitive::Quadratic(..) => "Quadratic",
-                    Primitive::Line(..) => "Line",
-                    Primitive::Move(..) => "Move",
-                    Primitive::Arc(..) => "Arc",
-                    Primitive::Close => "Close",
-                })
-                .or_insert(0) += 1;
-                acc
-            });
-        println!("{:#?}\nTotal: {}", counts, self.primitives.len());
+            .filter_map(|(k, v)| (*k != "").then_some(format!("{k}: {v}")))
+            .collect::<Vec<_>>();
+        counts.sort();
+        println!("{}", counts.join("\n"));
     }
 
     pub fn save(&self, path: &str) {
@@ -444,7 +785,7 @@ impl SvgReader {
         }
         writeln!(
             file,
-            "<path d='{}' fill='black' stroke='black' stroke-width='0'/>",
+            "<path d='{}' fill='white' stroke='black' stroke-width='0'/>",
             d.trim()
         )
         .unwrap();
@@ -587,9 +928,11 @@ impl SvgReader {
         println!("{lines});");
         println!("{quad_ab});");
         println!("{quad_c});");
-        println!("for (int i = 0; i < lines.length(); ++i) combine(d, sdf_line(p, lines[i]));");
         println!(
-            "for (int i = 0; i < quad_ab.length(); ++i) combine(d, sdf_bezier(p, quad_ab[i], quad_c[i]));"
+            "for (int i = 0; i < lines.length(); ++i) combine(d, sdf_line(p, lines[i].xy, lines[i].zw));"
+        );
+        println!(
+            "for (int i = 0; i < quad_ab.length(); ++i) combine(d, sdf_bezier(p, quad_ab[i].xy, quad_ab[i].zw, quad_c[i]));"
         );
     }
 
@@ -653,13 +996,26 @@ impl SvgReader {
         (min_x, min_y, max_x, max_y)
     }
 
-    fn h_quadratic(y0: f32, y1: f32, y2: f32) -> f32 {
-        return ((y0 - y1) / (y0 - 2.0 * y1 + y2)).clamp(0.0, 1.0);
-    }
-
     fn quadratic(t: f32, x0: f32, y0: f32, x1: f32, y1: f32, x2: f32, y2: f32) -> (f32, f32) {
         let x = t * (t * (x2 - 2.0 * x1 + x0) + 2.0 * (x1 - x0)) + x0;
         let y = t * (t * (y2 - 2.0 * y1 + y0) + 2.0 * (y1 - y0)) + y0;
+        (x, y)
+    }
+
+    fn cubic(
+        t: f32,
+        x0: f32,
+        y0: f32,
+        x1: f32,
+        y1: f32,
+        x2: f32,
+        y2: f32,
+        x3: f32,
+        y3: f32,
+    ) -> (f32, f32) {
+        let s = 1.0 - t;
+        let x = s * s * s * x0 + 3.0 * s * s * t * x1 + 3.0 * s * t * t * x2 + t * t * t * x3;
+        let y = s * s * s * y0 + 3.0 * s * s * t * y1 + 3.0 * s * t * t * y2 + t * t * t * y3;
         (x, y)
     }
 
@@ -712,8 +1068,8 @@ impl SvgReader {
     }
 }
 fn main() {
-    let mut svg = SvgReader::new("test.svg");
+    let mut svg = SvgReader::new("logo.svg");
     svg.optimize();
-    // svg.save("save.svg");
+    svg.save("save.svg");
     svg.shader_arr();
 }
